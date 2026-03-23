@@ -1,0 +1,32 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [
+                "--config",
+                "radio-config.example.json",
+                "--log-level",
+                "trace"
+            ],
+            "cwd": "${workspaceFolder:Radio}",
+            "name": "Debug Radio",
+            "target": "Radio",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug All"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [
+                "--config",
+                "radio-config.example.json"
+            ],
+            "cwd": "${workspaceFolder:Radio}",
+            "name": "Release Radio",
+            "target": "Radio",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Radio"
+        }
+    ]
+}

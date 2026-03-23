@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 17298,
+  "protocol": "http",
+  "bitrateKbps": 128,
+  "sampleRate": 44100,
+  "ffmpegPath": "/opt/homebrew/bin/ffmpeg",
+  "streams": [
+    {
+      "radioStreamName": "Diamond City Radio",
+      "mediaDir": "./media/diamond-city",
+      "playbackOrder": "random"
+    },
+    {
+      "radioStreamName": "Classical Vault",
+      "mediaDir": "./media/classical",
+      "playbackOrder": "az"
+    }
+  ]
+}
