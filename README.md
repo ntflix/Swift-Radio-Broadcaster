@@ -94,7 +94,7 @@ Segments are served from the same slug path (for example `.../diamond-city-radio
 
 ## Notes
 
-- This app does not require an external Icecast/SHOUTcast server.
+- This app serves HLS directly from the process.
 - Clients connect directly to this process using normal HTTP and HLS playback support.
 - HLS is generated as a rolling live window with 106-second segments (single shared `.m3u8` window per stream). Details in `ffmpeg` args in `RadioPublisher.swift`.
 - Old segments are deleted over time; clients should stay near live edge. Only 2 segments are kept in the playlist at a time, and segments are deleted after 1 playlist cycle (20 seconds) to prevent clients from requesting deleted segments.
