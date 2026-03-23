@@ -4,7 +4,6 @@
   "protocol": "http",
   "bitrateKbps": 128,
   "sampleRate": 44100,
-  "ffmpegPath": "/opt/homebrew/bin/ffmpeg",
   "streams": [
     {
       "radioStreamName": "Diamond City Radio",

@@ -1,0 +1,19 @@
+services:
+  radio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: radio
+    restart: unless-stopped
+    ports:
+      - "17298:17298"
+    volumes:
+      - ./radio-config.example.json:/app/radio-config.json:ro
+      - ./media:/app/media:ro
+    command:
+      - --config
+      - /app/radio-config.json
+      - --host
+      - 0.0.0.0
+      - --ffmpeg-path
+      - /usr/bin/ffmpeg

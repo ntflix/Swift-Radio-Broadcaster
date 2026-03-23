@@ -1,6 +1,15 @@
 import Foundation
 import Logging
-import Network
+
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
+#if os(Linux)
+    import Glibc
+#else
+    import Darwin
+#endif
 
 final class RadioPublisher: @unchecked Sendable {
     private enum PublisherError: Error {
@@ -426,8 +435,9 @@ final class RadioPublisher: @unchecked Sendable {
     private let streamConfigs: [StreamConfig]
     private var logger: Logger
     private var keepRunning = true
-    private var listener: NWListener?
+    private var serverSocket: Int32 = -1
     private let listenerQueue = DispatchQueue(label: "radio.server.listener")
+    private var acceptWorkItem: DispatchWorkItem?
     private var workers: [StreamWorker] = []
     private var signalSources: [DispatchSourceSignal] = []
 
@@ -440,10 +450,6 @@ final class RadioPublisher: @unchecked Sendable {
     func startAll() throws {
         cleanupStaleTempArtifacts()
 
-        let port = try validatedPort(options.port)
-        let listener = try NWListener(using: .tcp, on: port)
-        self.listener = listener
-
         var workersBySlug: [String: StreamWorker] = [:]
         for config in streamConfigs {
             let slug = slugify(config.radioStreamName)
@@ -455,31 +461,21 @@ final class RadioPublisher: @unchecked Sendable {
         }
         let routes = RouteTable(workersBySlug: workersBySlug)
 
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { return }
-            self.handleConnection(connection, routes: routes)
-        }
+        let socket = try createListeningSocket(host: options.host, port: options.port)
+        serverSocket = socket
 
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.logger.info(
-                    "Standalone HLS server listening on \(self.options.host):\(self.options.port)"
-                )
-                for worker in self.workers.sorted(by: { $0.slug < $1.slug }) {
-                    self.logger.info(
-                        "HLS '\(worker.config.radioStreamName)' available at http://\(self.options.host):\(self.options.port)/\(worker.slug)/index.m3u8"
-                    )
-                }
-            case .failed(let error):
-                self.logger.error("Server listener failed: \(error.localizedDescription)")
-            default:
-                break
-            }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.acceptLoop(routes: routes)
         }
+        acceptWorkItem = workItem
+        listenerQueue.async(execute: workItem)
 
-        listener.start(queue: listenerQueue)
+        logger.info("Standalone HLS server listening on \(options.host):\(options.port)")
+        for worker in workers.sorted(by: { $0.slug < $1.slug }) {
+            logger.info(
+                "HLS '\(worker.config.radioStreamName)' available at http://\(options.host):\(options.port)/\(worker.slug)/index.m3u8"
+            )
+        }
         logger.info("Started \(workers.count) HLS endpoint(s). Press Ctrl+C to stop.")
     }
 
@@ -517,60 +513,94 @@ final class RadioPublisher: @unchecked Sendable {
         }
     }
 
-    private func handleConnection(_ connection: NWConnection, routes: RouteTable) {
-        logger.debug("Incoming connection from \(endpointString(connection.endpoint)).")
-        connection.start(queue: listenerQueue)
-        receiveHTTPRequest(connection, routes: routes, accumulated: Data())
-    }
+    private func acceptLoop(routes: RouteTable) {
+        while keepRunning {
+            var clientAddress = sockaddr_storage()
+            var clientAddressLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
 
-    private func receiveHTTPRequest(
-        _ connection: NWConnection, routes: RouteTable, accumulated: Data
-    ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) {
-            [weak self] data, _, isComplete, error in
-            guard let self else {
-                connection.cancel()
-                return
+            let clientSocket = withUnsafeMutablePointer(to: &clientAddress) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(serverSocket, $0, &clientAddressLen)
+                }
             }
 
-            if let error {
-                self.logger.error("Connection receive error: \(error.localizedDescription)")
-                connection.cancel()
-                return
+            if clientSocket < 0 {
+                let code = errno
+                if !keepRunning {
+                    break
+                }
+                if code == EINTR {
+                    continue
+                }
+                logger.debug("Accept failed: \(String(cString: strerror(code)))")
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
             }
 
-            var buffer = accumulated
-            if let data, !data.isEmpty {
-                buffer.append(data)
-            }
-
-            if buffer.count > 65_536 {
-                self.logger.debug(
-                    "Request headers too large from \(self.endpointString(connection.endpoint)).")
-                self.sendSimpleResponse(
-                    connection,
-                    status: "413 Payload Too Large",
-                    contentType: "text/plain; charset=utf-8",
-                    body: Data("Request Too Large\n".utf8)
-                )
-                return
-            }
-
-            if self.hasCompleteHTTPHeaders(buffer) || isComplete {
-                self.processHTTPRequest(connection, routes: routes, raw: buffer)
-                return
-            }
-
-            self.receiveHTTPRequest(connection, routes: routes, accumulated: buffer)
+            let remote = endpointString(from: clientAddress, length: clientAddressLen)
+            logger.debug("Incoming connection from \(remote).")
+            handleClientSocket(clientSocket, routes: routes, remote: remote)
+            _ = close(clientSocket)
         }
     }
 
-    private func processHTTPRequest(_ connection: NWConnection, routes: RouteTable, raw: Data) {
+    private func handleClientSocket(_ clientSocket: Int32, routes: RouteTable, remote: String) {
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 16_384)
+
+        while true {
+            let bytesRead = recv(clientSocket, &chunk, chunk.count, 0)
+            if bytesRead > 0 {
+                buffer.append(chunk, count: bytesRead)
+
+                if buffer.count > 65_536 {
+                    logger.debug("Request headers too large from \(remote).")
+                    sendSimpleResponse(
+                        clientSocket,
+                        status: "413 Payload Too Large",
+                        contentType: "text/plain; charset=utf-8",
+                        body: Data("Request Too Large\n".utf8)
+                    )
+                    return
+                }
+
+                if hasCompleteHTTPHeaders(buffer) {
+                    break
+                }
+
+                continue
+            }
+
+            if bytesRead == 0 {
+                break
+            }
+
+            if errno == EINTR {
+                continue
+            }
+
+            logger.error(
+                "Connection receive error from \(remote): \(String(cString: strerror(errno)))")
+            return
+        }
+
+        guard !buffer.isEmpty else {
+            return
+        }
+
+        processHTTPRequest(clientSocket, routes: routes, raw: buffer, remote: remote)
+    }
+
+    private func processHTTPRequest(
+        _ clientSocket: Int32,
+        routes: RouteTable,
+        raw: Data,
+        remote: String
+    ) {
         guard let request = String(data: raw, encoding: .utf8) else {
-            logger.debug(
-                "Failed UTF-8 decode for request from \(endpointString(connection.endpoint)).")
+            logger.debug("Failed UTF-8 decode for request from \(remote).")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "400 Bad Request",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Bad Request\n".utf8)
@@ -579,10 +609,9 @@ final class RadioPublisher: @unchecked Sendable {
         }
 
         guard let path = parseRequestPath(from: request) else {
-            logger.debug(
-                "Could not parse HTTP request line from \(endpointString(connection.endpoint)).")
+            logger.debug("Could not parse HTTP request line from \(remote).")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "400 Bad Request",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Bad Request\n".utf8)
@@ -590,7 +619,7 @@ final class RadioPublisher: @unchecked Sendable {
             return
         }
 
-        logger.debug("HTTP path from \(endpointString(connection.endpoint)): \(path)")
+        logger.debug("HTTP path from \(remote): \(path)")
 
         if path == "/" {
             let lines =
@@ -601,7 +630,7 @@ final class RadioPublisher: @unchecked Sendable {
                 }
             let body = Data((lines + [""]).joined(separator: "\n").utf8)
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "200 OK",
                 contentType: "text/plain; charset=utf-8",
                 body: body
@@ -611,10 +640,9 @@ final class RadioPublisher: @unchecked Sendable {
 
         let components = path.split(separator: "/", omittingEmptySubsequences: true)
         guard components.count == 2 else {
-            logger.debug(
-                "Route mismatch for path '\(path)' from \(endpointString(connection.endpoint)).")
+            logger.debug("Route mismatch for path '\(path)' from \(remote).")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "404 Not Found",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Not Found\n".utf8)
@@ -626,10 +654,9 @@ final class RadioPublisher: @unchecked Sendable {
         let fileName = String(components[1])
 
         guard let worker = routes.workersBySlug[streamSlug] else {
-            logger.debug(
-                "Unknown stream slug '\(streamSlug)' from \(endpointString(connection.endpoint)).")
+            logger.debug("Unknown stream slug '\(streamSlug)' from \(remote).")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "404 Not Found",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Not Found\n".utf8)
@@ -640,7 +667,7 @@ final class RadioPublisher: @unchecked Sendable {
         switch worker.servePathComponent(fileName) {
         case .available(let status, let contentType, let data):
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: status,
                 contentType: contentType,
                 body: data
@@ -648,7 +675,7 @@ final class RadioPublisher: @unchecked Sendable {
         case .playlistNotReady:
             logger.debug("HLS playlist not ready yet for stream '\(streamSlug)'.")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "503 Service Unavailable",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("HLS stream warming up, retry shortly\n".utf8)
@@ -657,7 +684,7 @@ final class RadioPublisher: @unchecked Sendable {
             logger.debug(
                 "Stale/expired HLS segment '\(fileName)' requested for stream '\(streamSlug)'.")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "410 Gone",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Segment expired; refresh playlist\n".utf8)
@@ -665,7 +692,7 @@ final class RadioPublisher: @unchecked Sendable {
         case .notFound:
             logger.debug("Missing HLS asset '\(fileName)' for stream '\(streamSlug)'.")
             sendSimpleResponse(
-                connection,
+                clientSocket,
                 status: "404 Not Found",
                 contentType: "text/plain; charset=utf-8",
                 body: Data("Not Found\n".utf8)
@@ -681,7 +708,10 @@ final class RadioPublisher: @unchecked Sendable {
     }
 
     private func sendSimpleResponse(
-        _ connection: NWConnection, status: String, contentType: String, body: Data
+        _ clientSocket: Int32,
+        status: String,
+        contentType: String,
+        body: Data
     ) {
         let responseTime = httpDateString(Date())
         var header = "HTTP/1.1 \(status)\r\n"
@@ -698,39 +728,13 @@ final class RadioPublisher: @unchecked Sendable {
         header += "Connection: close\r\n"
         header += "\r\n"
 
-        logger.debug(
-            "Sending HTTP \(status) to \(endpointString(connection.endpoint)) with body bytes: \(body.count)."
-        )
-        connection.send(
-            content: Data(header.utf8),
-            completion: .contentProcessed { [weak self] headerError in
-                guard let self else {
-                    connection.cancel()
-                    return
-                }
+        logger.debug("Sending HTTP \(status) with body bytes: \(body.count).")
+        let wroteHeader = writeAll(clientSocket, data: Data(header.utf8))
+        let wroteBody = writeAll(clientSocket, data: body)
 
-                if let headerError {
-                    self.logger.debug(
-                        "Header send failed to \(self.endpointString(connection.endpoint)): \(headerError)."
-                    )
-                    connection.cancel()
-                    return
-                }
-
-                connection.send(
-                    content: body,
-                    completion: .contentProcessed { bodyError in
-                        if let bodyError {
-                            self.logger.debug(
-                                "Body send failed to \(self.endpointString(connection.endpoint)): \(bodyError)."
-                            )
-                        }
-
-                        self.listenerQueue.asyncAfter(deadline: .now() + .milliseconds(200)) {
-                            connection.cancel()
-                        }
-                    })
-            })
+        if !wroteHeader || !wroteBody {
+            logger.debug("Failed to send complete HTTP response for status \(status).")
+        }
     }
 
     private func parseRequestPath(from request: String) -> String? {
@@ -750,11 +754,73 @@ final class RadioPublisher: @unchecked Sendable {
         return path
     }
 
-    private func validatedPort(_ value: Int) throws -> NWEndpoint.Port {
-        guard let port = NWEndpoint.Port(rawValue: UInt16(value)) else {
-            throw CliError.invalidValue("Invalid port '\(value)'.")
+    private func createListeningSocket(host: String, port: Int) throws -> Int32 {
+        guard (1...65_535).contains(port) else {
+            throw CliError.invalidValue("Invalid port '\(port)'.")
         }
-        return port
+
+        #if os(Linux)
+            let socketType = Int32(SOCK_STREAM.rawValue)
+        #else
+            let socketType = SOCK_STREAM
+        #endif
+
+        let socketFD = socket(AF_INET, socketType, 0)
+        guard socketFD >= 0 else {
+            throw CliError.message(
+                "Failed to create listening socket: \(String(cString: strerror(errno)))")
+        }
+
+        var reuseAddr: Int32 = 1
+        _ = withUnsafePointer(to: &reuseAddr) {
+            setsockopt(
+                socketFD,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                UnsafeRawPointer($0),
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+
+        let bindHost = normalizedBindHost(host)
+        if bindHost == "0.0.0.0" {
+            address.sin_addr = in_addr(s_addr: in_addr_t(0))
+        } else {
+            let result = bindHost.withCString {
+                inet_pton(AF_INET, $0, &address.sin_addr)
+            }
+            if result != 1 {
+                _ = close(socketFD)
+                throw CliError.invalidValue(
+                    "Invalid host '\(host)'. Use '0.0.0.0', 'localhost', or an IPv4 address.")
+            }
+        }
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        guard bindResult == 0 else {
+            let errorText = String(cString: strerror(errno))
+            _ = close(socketFD)
+            throw CliError.message(
+                "Failed to bind server socket on \(bindHost):\(port): \(errorText)"
+            )
+        }
+
+        guard listen(socketFD, SOMAXCONN) == 0 else {
+            let errorText = String(cString: strerror(errno))
+            _ = close(socketFD)
+            throw CliError.message("Failed to listen on server socket: \(errorText)")
+        }
+
+        return socketFD
     }
 
     private func stopAll() throws {
@@ -775,8 +841,19 @@ final class RadioPublisher: @unchecked Sendable {
 
         cleanupStaleTempArtifacts()
 
-        listener?.cancel()
-        listener = nil
+        if serverSocket >= 0 {
+            #if os(Linux)
+                let shutdownHow = Int32(SHUT_RDWR)
+            #else
+                let shutdownHow = SHUT_RDWR
+            #endif
+            _ = shutdown(serverSocket, shutdownHow)
+            _ = close(serverSocket)
+            serverSocket = -1
+        }
+
+        acceptWorkItem?.cancel()
+        acceptWorkItem = nil
 
         if !failures.isEmpty {
             throw PublisherError.cleanupFailed(failures.joined(separator: " | "))
@@ -831,12 +908,78 @@ final class RadioPublisher: @unchecked Sendable {
         return trimmed.isEmpty ? "stream" : trimmed
     }
 
-    private func endpointString(_ endpoint: NWEndpoint) -> String {
-        switch endpoint {
-        case .hostPort(let host, let port):
-            return "\(host):\(port)"
-        default:
-            return String(describing: endpoint)
+    private func normalizedBindHost(_ host: String) -> String {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "0.0.0.0"
+        }
+
+        let lower = trimmed.lowercased()
+        if lower == "localhost" {
+            return "127.0.0.1"
+        }
+        if lower == "::" || lower == "[::]" {
+            return "0.0.0.0"
+        }
+        return trimmed
+    }
+
+    private func endpointString(from address: sockaddr_storage, length _: socklen_t) -> String {
+        guard address.ss_family == sa_family_t(AF_INET) else {
+            return "unknown"
+        }
+
+        var addressCopy = address
+        var ipv4 = withUnsafePointer(to: &addressCopy) {
+            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                $0.pointee
+            }
+        }
+
+        var hostBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        let ptr = withUnsafePointer(to: &ipv4.sin_addr) {
+            inet_ntop(AF_INET, $0, &hostBuffer, socklen_t(hostBuffer.count))
+        }
+
+        let host: String
+        if ptr != nil {
+            let end = hostBuffer.firstIndex(of: 0) ?? hostBuffer.count
+            let bytes = hostBuffer[..<end].map { UInt8(bitPattern: $0) }
+            host = String(decoding: bytes, as: UTF8.self)
+        } else {
+            host = "unknown"
+        }
+        let port = Int(UInt16(bigEndian: ipv4.sin_port))
+        return "\(host):\(port)"
+    }
+
+    private func writeAll(_ socket: Int32, data: Data) -> Bool {
+        return data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return true
+            }
+
+            var sent = 0
+            while sent < rawBuffer.count {
+                let remaining = rawBuffer.count - sent
+                let sentNow = send(socket, baseAddress.advanced(by: sent), remaining, 0)
+                if sentNow > 0 {
+                    sent += sentNow
+                    continue
+                }
+
+                if sentNow == 0 {
+                    return false
+                }
+
+                if errno == EINTR {
+                    continue
+                }
+
+                return false
+            }
+
+            return true
         }
     }
 
